@@ -104,7 +104,7 @@ final class CalibratorTests: XCTestCase {
         let late: [String: Double] = ["A": 0.012, "B": 0.040]       // seconds
 
         let end = Calibrator.endTime(of: slots)
-        var samples = [Float](repeating: 0, count: Int(Double(end).nanosToSeconds * sr) + 10_000)
+        var samples = [Float](repeating: 0, count: Int(end.nanosToSeconds * sr) + 10_000)
         for slot in slots {
             let start = Int((slot.leaderTime.nanosToSeconds + late[slot.peerID]!) * sr)
             for i in 0..<chirp.count { samples[start + i] += 0.2 * chirp[i] }
