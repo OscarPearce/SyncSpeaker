@@ -27,6 +27,11 @@ protocol SyncPlayer: AnyObject {
     /// Called about twice a second while playing. `expected` maps a local time
     /// (when sound leaves the speaker) to the timeline position that should be heard then.
     func tick(expected: (Int64) -> Double)
+    /// Jump onto the timeline now (a seek), instead of trimming gradually.
+    func realign(expected: (Int64) -> Double)
+    /// Whether `setMuted` works (the echo monitor mutes other speakers with 3+ phones).
+    var canMute: Bool { get }
+    func setMuted(_ muted: Bool)
 }
 
 /// Turns timeline error into a tiny playback-rate trim.

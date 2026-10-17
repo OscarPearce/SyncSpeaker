@@ -7,11 +7,20 @@ enum TrackSource: Codable, Hashable {
     case local(id: String, title: String)
     /// A Spotify track URI, e.g. "spotify:track:4uLU6hMCjMI75M1A2tKUQC".
     case spotify(uri: String, title: String)
+    /// A local file played through `SimulatedSpotifyBackend`: Spotify's sync
+    /// path (commands only, random delays) without needing Spotify.
+    case simulatedSpotify(id: String, title: String)
 
     var title: String {
         switch self {
-        case .local(_, let t), .spotify(_, let t): return t
+        case .local(_, let t), .spotify(_, let t), .simulatedSpotify(_, let t): return t
         }
+    }
+
+    /// True for sources we can only command (resume / pause / seek).
+    var isRemote: Bool {
+        if case .local = self { return false }
+        return true
     }
 }
 
@@ -22,6 +31,21 @@ enum PeerRole: String, Codable {
 struct CalibrationSlot: Codable, Hashable {
     let peerID: String          // MCPeerID.displayName of the device that plays this slot
     let leaderTime: Int64       // when the chirp should come out of the speaker, leader ns
+}
+
+/// A cepstral peak: an echo between two speakers at `lagMillis` apart.
+struct EchoPeak: Codable, Hashable {
+    var lagMillis: Double
+    /// Height in standard deviations above the search range's mean.
+    var strength: Float
+}
+
+/// One echo measurement by the listening phone. See `EchoCorrector`.
+struct EchoReading: Codable, Hashable {
+    /// Strongest echo anywhere in the search range.
+    var strongest: EchoPeak?
+    /// Strongest echo near each requested candidate lag (same order).
+    var candidatePeaks: [EchoPeak?]
 }
 
 /// Everything sent between phones. Encoded as JSON (small, debuggable).
@@ -44,6 +68,21 @@ enum SyncMessage: Codable {
     /// speaker was late and should start earlier).
     case calibrationResult(correctionsMillis: [String: Double])
 
+    // Resume-delay probe: each device plays briefly in its slots while the
+    // others stay paused, and times its own resume with its own mic.
+    case resumeProbePlan(slots: [CalibrationSlot])
+
+    // Echo monitor (leader <-> listener, leader -> one follower)
+    /// Listener: record a few seconds and report the echo, scoring `candidatesMillis` too.
+    case echoMeasure(id: UInt32, candidatesMillis: [Double])
+    case echoResult(id: UInt32, reading: EchoReading?)
+    /// Move this speaker ahead by `aheadByMillis` (negative = later), right away.
+    /// (Always a jump: a gradual trim would still be under way at the next
+    /// echo check and get corrected twice.)
+    case shift(aheadByMillis: Double)
+    /// Silence this speaker while the echo monitor checks another pair.
+    case mute(Bool)
+
     // Status (followers -> leader, ~1 Hz)
     case status(PeerStatus)
 
@@ -62,6 +101,9 @@ struct PeerStatus: Codable, Hashable {
     var rate: Double?               // current varispeed rate (local engine)
     var clockRMSMillis: Double?     // clock-sync residual
     var routeName: String
+    var resumeLatencyMillis: Double? = nil   // learned resume delay (remote engines)
+    var resumeJitterMillis: Double? = nil
+    var trimMillis: Double? = nil            // echo-monitor correction so far
 }
 
 enum MessageCodec {

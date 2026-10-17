@@ -39,3 +39,9 @@ their Bluetooth speakers in sync. Read DESIGN.md before changing sync logic.
   ~250 ms before they're due (`playChirpWhenDue`).
 - Spotify: SDK v5.0.1 (SPM package `SpotifyiOS`) is optional and gated by
   `#if canImport(SpotifyiOS)`; a stub keeps the app building without it.
+- Spotify-style sync lives in `RemoteSyncPlayer` over a `RemoteBackend`.
+  `SimulatedSpotifyBackend` must stay limited to what Spotify allows
+  (resume/pause/seek, random delays, coarse position reports), or testing
+  with it stops meaning anything.
+- Echo-monitor shifts are always immediate jumps; a gradual trim would still be
+  under way at the next check and get corrected twice.

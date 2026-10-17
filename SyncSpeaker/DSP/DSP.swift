@@ -89,15 +89,25 @@ enum DSP {
     /// the echo lag stays put, so averaging favours the echo.
     ///
     /// The cepstrum can't tell which copy is ahead; resolve that by nudging one
-    /// player and re-measuring (see DESIGN.md).
+    /// player and re-measuring (see `EchoCorrector` and DESIGN.md).
     static func echoLag(in signal: [Float],
                         sampleRate: Double,
                         minLag: Double = 0.004,
                         maxLag: Double = 0.300,
                         frameLength: Int = 32_768) -> EchoEstimate? {
+        guard let cepstrum = averagedCepstrum(of: signal, sampleRate: sampleRate,
+                                              maxLag: maxLag, frameLength: frameLength) else { return nil }
+        return strongestEcho(in: cepstrum, sampleRate: sampleRate, minLag: minLag)
+    }
+
+    /// Power cepstrum averaged over half-overlapping Hann-windowed frames,
+    /// indices 0 ... maxLag (in samples).
+    static func averagedCepstrum(of signal: [Float],
+                                 sampleRate: Double,
+                                 maxLag: Double = 0.300,
+                                 frameLength: Int = 32_768) -> [Float]? {
         let hop = frameLength / 2
         let maxLagN = Int(maxLag * sampleRate)
-        let minLagN = max(1, Int(minLag * sampleRate))
         guard signal.count >= frameLength, maxLagN < frameLength / 2,
               let fft = ComplexFFT(n: frameLength) else { return nil }
 
@@ -116,17 +126,84 @@ enum DSP {
             frames += 1
             start += hop
         }
-        guard frames > 0 else { return nil }
+        return frames > 0 ? avg : nil
+    }
 
-        let range = Array(avg[minLagN...maxLagN])
+    /// The highest cepstral peak at or beyond `minLag`.
+    static func strongestEcho(in cepstrum: [Float], sampleRate: Double, minLag: Double = 0.004) -> EchoEstimate? {
+        let minLagN = max(1, Int(minLag * sampleRate))
+        guard cepstrum.count > minLagN + 2 else { return nil }
+        let range = Array(cepstrum[minLagN...])
         guard let best = argmax(range) else { return nil }
         let (i, peak) = best
-        let mean = range.reduce(0, +) / Float(range.count)
-        let variance = range.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Float(range.count)
-        let sd = max(variance.squareRoot(), 1e-12)
-
+        let (mean, sd) = meanAndSD(range)
         let lag = Double(minLagN + i) + parabolicOffset(range, at: i)
         return EchoEstimate(lagSeconds: lag / sampleRate, strength: (peak - mean) / sd)
+    }
+
+    /// The highest cepstral peak within `tolerance` of `lag`. Its strength is in
+    /// standard deviations above the mean of the whole search range, so peaks
+    /// from different windows compare fairly. Used after a nudge to ask "did
+    /// the echo move to around lag A or around lag B, and exactly where?".
+    static func echoPeak(in cepstrum: [Float],
+                         sampleRate: Double,
+                         near lag: Double,
+                         tolerance: Double = 0.012,
+                         minLag: Double = 0.004) -> EchoEstimate? {
+        let minLagN = max(1, Int(minLag * sampleRate))
+        guard cepstrum.count > minLagN + 2 else { return nil }
+        let (mean, sd) = meanAndSD(Array(cepstrum[minLagN...]))
+        let lo = max(minLagN, Int(((lag - tolerance) * sampleRate).rounded(.down)))
+        let hi = min(cepstrum.count - 1, Int(((lag + tolerance) * sampleRate).rounded(.up)))
+        guard lo <= hi else { return nil }
+        let window = Array(cepstrum[lo...hi])
+        guard let best = argmax(window) else { return nil }
+        let (i, peak) = best
+        let at = Double(lo + i) + parabolicOffset(window, at: i)
+        return EchoEstimate(lagSeconds: at / sampleRate, strength: (peak - mean) / sd)
+    }
+
+    // MARK: Onset
+
+    /// Sample index where sound starts after a quiet lead-in, or nil if it
+    /// never clearly rises above the lead-in's noise floor. Used to time how
+    /// long a player takes to make sound after `resume()`.
+    static func onsetIndex(in x: [Float],
+                           sampleRate: Double,
+                           leadIn: Double = 0.3,
+                           factor: Float = 8,
+                           minRMS: Float = 0.002) -> Double? {
+        let frame = max(1, Int(0.002 * sampleRate))
+        let leadN = Int(leadIn * sampleRate)
+        guard leadN >= frame * 4, x.count > leadN + frame * 4 else { return nil }
+
+        func rms(_ start: Int) -> Float {
+            var acc: Float = 0
+            for i in start ..< start + frame { acc += x[i] * x[i] }
+            return (acc / Float(frame)).squareRoot()
+        }
+
+        var floors: [Float] = []
+        var s = 0
+        while s + frame <= leadN {
+            floors.append(rms(s))
+            s += frame
+        }
+        floors.sort()
+        let threshold = max(floors[floors.count / 2] * factor, minRMS)
+
+        s = leadN
+        while s + frame <= x.count {
+            if rms(s) > threshold {
+                // First individual sample above the threshold, looking one frame back.
+                for i in max(leadN, s - frame) ..< s + frame where abs(x[i]) > threshold {
+                    return Double(i)
+                }
+                return Double(s)
+            }
+            s += frame
+        }
+        return nil
     }
 
     // MARK: Helpers
@@ -143,6 +220,13 @@ enum DSP {
 
     static func hann(_ n: Int) -> [Float] {
         (0..<n).map { 0.5 - 0.5 * cos(2 * Float.pi * Float($0) / Float(n - 1)) }
+    }
+
+    static func meanAndSD(_ x: [Float]) -> (mean: Float, sd: Float) {
+        guard !x.isEmpty else { return (0, 1e-12) }
+        let mean = x.reduce(0, +) / Float(x.count)
+        let variance = x.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Float(x.count)
+        return (mean, max(variance.squareRoot(), 1e-12))
     }
 
     static func argmax(_ x: [Float]) -> (Int, Float)? {

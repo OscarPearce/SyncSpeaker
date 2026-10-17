@@ -5,7 +5,8 @@ Each function mirrors one in the Swift app:
   ClockSync          -> SyncSpeaker/Core/ClockSync.swift
   chirp / detect     -> SyncSpeaker/DSP/DSP.swift  (DSP.chirp, DSP.detect)
   echo_lag           -> SyncSpeaker/DSP/DSP.swift  (DSP.echoLag)
-  PIController       -> SyncSpeaker/Audio/DriftController.swift
+  PIController       -> SyncSpeaker/Audio/SyncPlayer.swift  (DriftController)
+  EchoCorrector      -> SyncSpeaker/Core/EchoCorrector.swift
 
 Run:  python3 sim/simulate.py
 Needs numpy. Exits non-zero if any check misses its target.
@@ -291,11 +292,118 @@ def sim_drift(minutes=6, hw_ppm=60):
           f"after 30 s settling, worst error {worst_after * 1000:.2f} ms with {hw_ppm} ppm clock drift")
 
 
+# ---------------------------------------------------------------- echo monitor (Spotify-style)
+
+class EchoCorrector:
+    """Mirror of EchoCorrector.swift. Lags in ms; a peak is (lag_ms, strength_sd) or None."""
+    def __init__(self, threshold=20.0, min_strength=4.0, margin=1.5, same_lag=2.0,
+                 min_lag=4.0, max_lag=300.0, tolerance=12.0):
+        self.threshold, self.min_strength, self.margin = threshold, min_strength, margin
+        self.same_lag, self.min_lag, self.max_lag, self.tolerance = same_lag, min_lag, max_lag, tolerance
+        self.reflections = []
+
+    def assess(self, peak):
+        if peak is None or peak[1] < self.min_strength:
+            return ("no_signal",)
+        lag = peak[0]
+        if lag < self.threshold:
+            return ("in_sync", lag)
+        if any(abs(r - lag) <= self.same_lag for r in self.reflections):
+            return ("reflection", lag)
+        return ("nudge", lag, self.nudge_size(lag))
+
+    def nudge_size(self, lag):
+        for n in (25.0, 40.0, 60.0):
+            if abs(lag - n) >= self.min_lag + 2 * self.same_lag and lag + n <= self.max_lag:
+                return n
+        return 25.0
+
+    def candidates(self, lag, nudge):
+        return [lag + nudge, abs(lag - nudge)]
+
+    def resolve(self, lag, nudge, peaks):
+        """Returns the follower's error now (after the nudge), or None if inconclusive."""
+        sa = peaks[0][1] if peaks[0] else 0.0
+        sb = peaks[1][1] if peaks[1] else 0.0
+        if max(sa, sb) < self.min_strength:
+            self.reflections = (self.reflections + [lag])[-6:]
+            return None
+        if peaks[0] and sa >= sb + self.margin:
+            return peaks[0][0]
+        if peaks[1] and sb >= sa + self.margin:
+            return peaks[1][0] if nudge >= lag else -peaks[1][0]
+        return None
+
+
+def listen(error_ms, corrector, candidates=()):
+    """What the listening phone reports: the echo sits at |error| (cepstrum
+    precision ~0.3 ms, nothing below 4 ms), plus the best peak near each candidate."""
+    echo = abs(error_ms) + rng.normal(0, 0.3)
+    strongest = (echo, 12.0) if abs(error_ms) >= corrector.min_lag else None
+    peaks = [(echo, 12.0) if abs(c - echo) <= corrector.tolerance else (c, 1.0) for c in candidates]
+    return strongest, peaks
+
+
+def run_monitored_session(threshold, minutes=5.0, seek_sd=10.0, interval=15.0):
+    """Two speakers, Spotify-like: every correction is a seek that lands
+    `seek_sd` ms off. Start error from the pause/resume start, slow clock
+    drift, and sometimes a Bluetooth re-buffer that jumps the speaker late.
+    Returns (fraction of time within 30 ms after the first 30 s, seeks)."""
+    c = EchoCorrector(threshold=threshold)
+    error = rng.normal(0, 15)                       # after pause-then-resume start
+    drift = rng.normal(0, 20e-6) * 1000              # ms per second
+    rebuffer_at = rng.uniform(30, minutes * 60) if rng.random() < 0.3 else None
+    dt, t, seeks, good, counted = 0.5, 0.0, 0, 0, 0
+    events = [(interval, "check")]
+    state = {}
+    while t < minutes * 60:
+        error += drift * dt
+        if rebuffer_at is not None and t >= rebuffer_at:
+            error -= rng.normal(60, 20)
+            rebuffer_at = None
+        for ev in [e for e in events if e[0] <= t]:
+            events.remove(ev)
+            kind = ev[1]
+            if kind == "check":                       # 4 s recording ends now
+                d = c.assess(listen(error, c)[0])
+                if d[0] == "nudge":
+                    _, lag, nudge = d
+                    error += nudge + rng.normal(0, seek_sd)
+                    seeks += 1
+                    state = {"lag": lag, "nudge": nudge}
+                    events.append((t + 5.5, "resolve"))   # settle 1.5 s, record 4 s
+                else:
+                    events.append((t + interval, "check"))
+            elif kind == "resolve":
+                lag, nudge = state["lag"], state["nudge"]
+                _, peaks = listen(error, c, c.candidates(lag, nudge))
+                now = c.resolve(lag, nudge, peaks)
+                error += (-now if now is not None else -nudge) + rng.normal(0, seek_sd)
+                seeks += 1
+                events.append((t + interval, "check"))
+        if t >= 30:
+            counted += 1
+            good += abs(error) <= 30
+        t += dt
+    return good / max(counted, 1), seeks
+
+
+def sim_echo_monitor(sessions=300):
+    gated = [run_monitored_session(threshold=20.0) for _ in range(sessions)]
+    eager = [run_monitored_session(threshold=4.0) for _ in range(sessions)]
+    g_sync, g_seeks = np.mean([s for s, _ in gated]), np.mean([k for _, k in gated])
+    e_sync, e_seeks = np.mean([s for s, _ in eager]), np.mean([k for _, k in eager])
+    check("echo monitor (20 ms threshold)", g_sync >= 0.9 and g_seeks < e_seeks,
+          f"within 30 ms {g_sync:.1%} of the time with {g_seeks:.1f} seeks per 5 min; "
+          f"correcting every offset: {e_sync:.1%} with {e_seeks:.1f} seeks")
+
+
 if __name__ == "__main__":
     sim_clock_sync()
     sim_calibration()
     sim_echo()
     sim_drift()
+    sim_echo_monitor()
     if FAILURES:
         print(f"\n{len(FAILURES)} check(s) failed: {', '.join(FAILURES)}")
         sys.exit(1)

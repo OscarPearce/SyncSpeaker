@@ -65,6 +65,27 @@ Every phone needs the same file with the same name. In the Files app, go to
 *On My iPhone → SyncSpeaker* and drop files in (mp3, m4a, wav, aiff, flac).
 From a Mac, drag them into the app in Finder's iPhone file-sharing view.
 
+## Testing Spotify-style sync without Spotify
+
+Spotify can only be told to resume, pause and seek, so it's synced by timing
+those commands. You can test all of that now with local files:
+
+1. On the host phone, turn on **Simulate Spotify** and tap a track (the click
+   track is easiest to judge). Each phone now plays it through a fake Spotify
+   that only takes resume, pause and seek commands, with Spotify-like random
+   delays and seeks that land ~10 ms off target.
+2. Before pressing anything else, tap **Measure resume delay**. Each phone in
+   turn plays about a second while its own mic times the start; three rounds,
+   averaged. The result shows under **Speakers** on the host.
+3. Tap the track again to play it. Phones start by resuming already-buffered audio.
+4. Turn on **Echo monitor** and choose the **Listening phone** (held where
+   people are). Every 15 s it listens to the music, measures the gap between
+   the speakers as an echo, and corrects a phone only if it's over 20 ms off.
+   The log under the switch shows each check.
+
+Each simulated phone gets a different random resume delay per launch, so
+without step 2 you'll hear a flam on the click track, and with it you shouldn't.
+
 ## Spotify setup (optional)
 
 1. Create an app at <https://developer.spotify.com/dashboard>.
@@ -73,7 +94,7 @@ From a Mac, drag them into the app in Finder's iPhone file-sharing view.
    - APIs: iOS SDK
 2. Under *User Management*, add the Spotify account of everyone who'll use it.
    Everyone needs Spotify Premium.
-3. Put your client ID in `SyncSpeaker/Audio/SpotifyPlayer.swift` (`clientID`).
+3. Put your client ID in `SyncSpeaker/Audio/SpotifyBackend.swift` (`clientID`).
 4. In `project.yml`, uncomment the `packages:` block and the `dependencies:`
    lines for `SpotifyiOS`, then run `xcodegen generate` again.
 5. In the app, tap **Connect Spotify** on each phone. Paste a track link or
@@ -105,9 +126,11 @@ These are simulations; real phones and rooms will be worse. Measure on devices.
 ```
 SyncSpeaker/
   App/        app entry point
-  Core/       HostClock, ClockSync, Messages, PeerSession, Calibrator, SessionCoordinator
+  Core/       HostClock, ClockSync, Messages, PeerSession, Calibrator,
+              EchoCorrector, SessionCoordinator
   Audio/      AudioRoute, SyncPlayer + DriftController, LocalEnginePlayer,
-              SpotifyPlayer, MicRecorder, LocalLibrary
+              RemoteSyncPlayer, SpotifyBackend, SimulatedSpotifyBackend,
+              MicRecorder, LocalLibrary
   DSP/        chirp, matched filter, cepstral echo check (Accelerate)
   UI/         SwiftUI views
 SyncSpeakerTests/  unit tests for the pure logic

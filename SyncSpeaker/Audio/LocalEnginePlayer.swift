@@ -118,9 +118,19 @@ final class LocalEnginePlayer: SyncPlayer {
             let wall = HostClock.nowNanos()
             guard wall - lastReseekNanos > 2_000_000_000 else { return }
             lastReseekNanos = wall
-            let at = wall + 300_000_000
-            start(outputAtLocalNanos: at, position: expected(at))
+            realign(expected: expected)
         }
+    }
+
+    func realign(expected: (Int64) -> Double) {
+        let at = HostClock.nowNanos() + 300_000_000
+        start(outputAtLocalNanos: at, position: expected(at))
+    }
+
+    var canMute: Bool { true }
+
+    func setMuted(_ muted: Bool) {
+        musicNode.volume = muted ? 0 : 1
     }
 
     /// Track position currently being rendered, and the local time it leaves the speaker.

@@ -119,3 +119,103 @@ final class CalibratorTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(result.corrections["B"]), 14, accuracy: 0.1)
     }
 }
+
+final class EchoCorrectorTests: XCTestCase {
+
+    private func peak(_ lag: Double, _ strength: Float = 10) -> EchoPeak {
+        EchoPeak(lagMillis: lag, strength: strength)
+    }
+
+    func testLeavesSmallOrUnclearOffsetsAlone() {
+        let c = EchoCorrector()
+        XCTAssertEqual(c.assess(peak(12)), .inSync(lagMillis: 12))
+        XCTAssertEqual(c.assess(peak(50, 2)), .noSignal)
+        XCTAssertEqual(c.assess(nil), .noSignal)
+    }
+
+    /// Follower off by `trueError`; the nudge itself lands `nudgeError` off
+    /// (a Spotify seek). The correction must cancel both.
+    func testFindsWhichSpeakerIsAheadAndCorrectsIt() {
+        for trueError in [35.0, -35.0, 70.0, -22.0, 150.0, -150.0] {
+            for nudgeError in [-9.0, 0.0, 9.0] {
+                var c = EchoCorrector()
+                guard case let .needsDirection(lag, nudge) = c.assess(peak(abs(trueError))) else {
+                    XCTFail("expected a nudge for \(trueError) ms")
+                    continue
+                }
+                let errorAfterNudge = trueError + nudge + nudgeError
+                let echoAfter = abs(errorAfterNudge)
+                // The listener reports the strongest peak near each candidate.
+                let peaks: [EchoPeak?] = c.candidateLags(lagMillis: lag, nudgeMillis: nudge).map {
+                    abs($0 - echoAfter) <= c.candidateToleranceMillis ? peak(echoAfter, 12) : peak($0, 1)
+                }
+                guard case let .error(now, before) = c.resolve(lagMillis: lag, nudgeMillis: nudge, peaks: peaks) else {
+                    XCTFail("unresolved for \(trueError) ms / nudge error \(nudgeError)")
+                    continue
+                }
+                XCTAssertEqual(now, errorAfterNudge, accuracy: 1e-9)
+                XCTAssertEqual(before, trueError + nudgeError, accuracy: 1e-9)
+                XCTAssertEqual(errorAfterNudge - now, 0, accuracy: 1e-9, "shifting by -now lands on the timeline")
+            }
+        }
+    }
+
+    func testNudgeKeepsCandidatesMeasurableAndApart() {
+        let c = EchoCorrector()
+        for lag in stride(from: 20.0, through: 240.0, by: 1.0) {
+            let nudge = c.nudgeSize(forLag: lag)
+            let candidates = c.candidateLags(lagMillis: lag, nudgeMillis: nudge)
+            XCTAssertGreaterThanOrEqual(candidates[1], 8, "lag \(lag)")
+            XCTAssertLessThanOrEqual(candidates[0], 300, "lag \(lag)")
+            XCTAssertGreaterThan(candidates[0] - candidates[1], 2 * c.candidateToleranceMillis, "lag \(lag)")
+        }
+    }
+
+    func testPeakThatIgnoresTheNudgeIsTreatedAsAReflection() {
+        var c = EchoCorrector()
+        guard case let .needsDirection(lag, nudge) = c.assess(peak(27, 9)) else {
+            return XCTFail("expected a nudge")
+        }
+        XCTAssertEqual(c.resolve(lagMillis: lag, nudgeMillis: nudge, peaks: [peak(60, 1), nil]), .inconclusive)
+        XCTAssertEqual(c.assess(peak(28, 9)), .reflection(lagMillis: 28))
+    }
+}
+
+final class SpotifyStyleSyncTests: XCTestCase {
+
+    func testOnsetFoundAfterQuietLeadIn() throws {
+        let sr = 48_000.0
+        var x = (0..<Int(sr)).map { _ in Float.random(in: -0.001...0.001) }
+        let start = 23_456
+        for i in start..<x.count { x[i] += 0.3 * sin(Float(i - start) * 0.05 + 0.3) }
+        let onset = try XCTUnwrap(DSP.onsetIndex(in: x, sampleRate: sr, leadIn: 0.3))
+        XCTAssertEqual(onset, Double(start), accuracy: 48, "within 1 ms")
+    }
+
+    func testEchoPeakFindsTheEchoNearTheRightCandidate() throws {
+        let sr = 48_000.0
+        let n = Int(sr * 4)
+        var music = [Float](repeating: 0, count: n)
+        var prev: Float = 0
+        for i in 0..<n {
+            let x = Float.random(in: -1...1)
+            prev = 0.7 * prev + 0.3 * x
+            music[i] = (i / 6_000) % 2 == 0 ? x : prev
+        }
+        var mix = music
+        for i in 2_640..<n { mix[i] += 0.8 * music[i - 2_640] }      // 55 ms
+
+        let cepstrum = try XCTUnwrap(DSP.averagedCepstrum(of: mix, sampleRate: sr))
+        let right = try XCTUnwrap(DSP.echoPeak(in: cepstrum, sampleRate: sr, near: 0.060))   // 5 ms off
+        let wrong = try XCTUnwrap(DSP.echoPeak(in: cepstrum, sampleRate: sr, near: 0.020))
+        XCTAssertEqual(right.lagSeconds, 0.055, accuracy: 0.0005)
+        XCTAssertGreaterThan(right.strength, EchoCorrector().minStrength)
+        XCTAssertLessThan(wrong.strength, right.strength - EchoCorrector().decisionMargin)
+    }
+
+    func testResumeDelayAverageIgnoresOutliers() throws {
+        let s = try XCTUnwrap(RemoteSyncPlayer.summarize([80, 84, 76, 300]))
+        XCTAssertEqual(s.mean, 80, accuracy: 0.01)
+        XCTAssertNil(RemoteSyncPlayer.summarize([]))
+    }
+}

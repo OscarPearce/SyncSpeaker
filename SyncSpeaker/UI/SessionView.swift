@@ -5,6 +5,7 @@ struct SessionView: View {
     @State private var tracks: [TrackSource] = []
     @State private var spotifyURI = ""
     @State private var listenerID = ""
+    @State private var simulateSpotify = false
 
     var body: some View {
         List {
@@ -20,6 +21,9 @@ struct SessionView: View {
 
             if session.isLeader {
                 librarySection
+                if session.track?.isRemote == true {
+                    spotifySyncSection
+                }
                 calibrationSection
             }
 
@@ -74,11 +78,12 @@ struct SessionView: View {
         Section {
             ForEach(tracks, id: \.self) { track in
                 Button {
-                    session.play(track)
+                    session.play(simulateSpotify ? simulated(track) : track)
                 } label: {
-                    Label(track.title, systemImage: "music.note")
+                    Label(track.title, systemImage: simulateSpotify ? "antenna.radiowaves.left.and.right" : "music.note")
                 }
             }
+            Toggle("Simulate Spotify", isOn: $simulateSpotify)
             HStack {
                 TextField("spotify:track:…", text: $spotifyURI)
                     .textInputAutocapitalization(.never)
@@ -93,8 +98,49 @@ struct SessionView: View {
         } header: {
             Text("Play on every phone")
         } footer: {
-            Text("Local files must be on every phone with the same name. Add them in the Files app under SyncSpeaker. The click track is the easiest way to hear sync errors.")
+            Text("Local files must be on every phone with the same name. Add them in the Files app under SyncSpeaker. The click track is the easiest way to hear sync errors. \"Simulate Spotify\" plays local files through the Spotify sync path (commands only, Spotify-like delays) so you can test it without Spotify.")
         }
+    }
+
+    private var spotifySyncSection: some View {
+        Section {
+            Button {
+                session.measureResumeDelays()
+            } label: {
+                Label("Measure resume delay", systemImage: "stopwatch")
+            }
+            .disabled(!session.canMeasureResumeDelay || isProbing)
+
+            switch session.resumeProbe {
+            case .idle: EmptyView()
+            case .running(let msg): Label(msg, systemImage: "ear").foregroundStyle(.secondary)
+            case .done(let msg): Label(msg, systemImage: "checkmark.circle").foregroundStyle(.green)
+            case .failed(let msg): Label(msg, systemImage: "xmark.circle").foregroundStyle(.red)
+            }
+
+            Toggle("Echo monitor", isOn: $session.echoMonitorEnabled)
+            Picker("Listening phone", selection: $session.monitorListenerID) {
+                Text("This phone").tag("")
+                ForEach(session.connectedPeers, id: \.self) { Text($0).tag($0) }
+            }
+            ForEach(session.echoLog, id: \.self) { line in
+                Text(line).font(.caption.monospaced()).foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Spotify-style sync")
+        } footer: {
+            Text("Resume delay: after loading a track and before pressing play, each phone plays a second at a time while its mic times how long the start takes. Echo monitor: while music plays, the listening phone hears the speakers as an echo of each other and corrects a phone only when it's more than 20 ms off.")
+        }
+    }
+
+    private var isProbing: Bool {
+        if case .running = session.resumeProbe { return true }
+        return false
+    }
+
+    private func simulated(_ track: TrackSource) -> TrackSource {
+        if case let .local(id, title) = track { return .simulatedSpotify(id: id, title: title) }
+        return track
     }
 
     private var calibrationSection: some View {
@@ -136,6 +182,12 @@ struct SessionView: View {
                 metricRow("Calibrated extra", ms(session.residualMillis, signed: true))
                 metricRow("Timeline error", session.playerErrorMillis.map { ms($0, signed: true) } ?? "–")
                 metricRow("Rate trim", session.playerRate.map { String(format: "%+.3f%%", ($0 - 1) * 100) } ?? "–")
+                if let resume = session.resumeLatencyMillis {
+                    metricRow("Resume delay", resumeText(resume, session.resumeJitterMillis))
+                }
+                if session.trimMillis != 0 {
+                    metricRow("Echo correction", ms(session.trimMillis, signed: true))
+                }
             }
 
             if session.isLeader {
@@ -146,6 +198,12 @@ struct SessionView: View {
                         metricRow("Ready", status.map { $0.ready ? "yes" : "no" } ?? "–")
                         metricRow("Timeline error", status?.errorMillis.map { ms($0, signed: true) } ?? "–")
                         metricRow("Clock accuracy", status?.clockRMSMillis.map { "±" + ms($0) } ?? "syncing…")
+                        if let resume = status?.resumeLatencyMillis {
+                            metricRow("Resume delay", resumeText(resume, status?.resumeJitterMillis))
+                        }
+                        if let trim = status?.trimMillis, trim != 0 {
+                            metricRow("Echo correction", ms(trim, signed: true))
+                        }
                     }
                 }
                 if session.connectedPeers.isEmpty {
@@ -195,6 +253,11 @@ struct SessionView: View {
 
     private func ms(_ value: Double, signed: Bool = false) -> String {
         String(format: signed ? "%+.1f ms" : "%.1f ms", value)
+    }
+
+    private func resumeText(_ mean: Double, _ sd: Double?) -> String {
+        guard let sd else { return ms(mean) + " (default)" }
+        return String(format: "%.0f ± %.0f ms", mean, sd)
     }
 
     /// Accepts "spotify:track:ID" or an open.spotify.com/track/ID link.

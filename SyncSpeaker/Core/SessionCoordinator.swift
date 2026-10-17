@@ -43,6 +43,21 @@ final class SessionCoordinator: ObservableObject {
     @Published private(set) var residualMillis = AudioRoute.residualMillis
     @Published private(set) var reportedDelayMillis = AudioRoute.reportedOutputDelayNanos.nanosToMillis
 
+    // Spotify-style sync (Spotify and simulated Spotify)
+    @Published private(set) var resumeProbe: CalibrationState = .idle
+    @Published private(set) var resumeLatencyMillis: Double?
+    @Published private(set) var resumeJitterMillis: Double?
+    /// This speaker's echo-monitor correction so far, ms (positive = moved ahead).
+    @Published private(set) var trimMillis = 0.0
+    /// Leader: continuously check sync with the listening phone's mic while music plays.
+    @Published var echoMonitorEnabled = false {
+        didSet { if echoMonitorEnabled != oldValue { echoMonitorChanged() } }
+    }
+    /// Phone whose mic the echo monitor uses. Empty = the leader.
+    @Published var monitorListenerID = ""
+    /// Recent echo-monitor results, newest first.
+    @Published private(set) var echoLog: [String] = []
+
     var isLeader: Bool { phase == .hosting }
     var myID: String { peer.localPeer.displayName }
 
@@ -51,7 +66,9 @@ final class SessionCoordinator: ObservableObject {
     private let peer: PeerSession
     private var clock = ClockSync()
     let localPlayer: LocalEnginePlayer
-    let spotifyPlayer: SpotifyPlayer
+    let spotifyBackend: SpotifyBackend
+    let spotifyPlayer: RemoteSyncPlayer
+    let simulatedPlayer: RemoteSyncPlayer
     private var activePlayer: SyncPlayer?
 
     private var pingTimer: Timer?
@@ -60,12 +77,22 @@ final class SessionCoordinator: ObservableObject {
     private var lastStatusSent: Int64 = 0
     private var routeObserver: NSObjectProtocol?
 
+    // Echo monitor (leader)
+    private var monitorTask: Task<Void, Never>?
+    private var corrector = EchoCorrector()
+    private var echoRequestID: UInt32 = 0
+    private var echoWaiters: [UInt32: CheckedContinuation<EchoReading?, Never>] = [:]
+    /// Seconds between echo checks.
+    private let echoInterval: UInt64 = 15
+
     init() {
         // Created here rather than as property defaults: their initializers
         // are main-actor isolated (UIDevice, AVAudioEngine setup).
         peer = PeerSession(deviceName: UIDevice.current.name)
         localPlayer = LocalEnginePlayer()
-        spotifyPlayer = SpotifyPlayer()
+        spotifyBackend = SpotifyBackend()
+        spotifyPlayer = RemoteSyncPlayer(backend: spotifyBackend)
+        simulatedPlayer = RemoteSyncPlayer(backend: SimulatedSpotifyBackend(engine: localPlayer.engine))
 
         do { try AudioRoute.configure() } catch { lastError = "Audio session: \(error.localizedDescription)" }
         Task { _ = await AudioRoute.requestMicrophone() }
@@ -77,7 +104,7 @@ final class SessionCoordinator: ObservableObject {
         peer.onFoundLeadersChanged = { [weak self] leaders in self?.foundLeaders = leaders }
 
         localPlayer.onNeedsResync = { [weak self] in self?.resyncAfterInterruption() }
-        spotifyPlayer.onConnectionChange = { [weak self] connected, error in
+        spotifyBackend.onConnectionChange = { [weak self] connected, error in
             self?.spotifyConnected = connected
             if let error { self?.lastError = "Spotify: \(error)" }
         }
@@ -118,8 +145,16 @@ final class SessionCoordinator: ObservableObject {
     }
 
     private func reset() {
+        echoMonitorEnabled = false
+        activePlayer?.setMuted(false)
         activePlayer?.pause()
         activePlayer = nil
+        trimMillis = 0
+        corrector.forgetReflections()
+        echoLog = []
+        resumeProbe = .idle
+        for (_, waiter) in echoWaiters { waiter.resume(returning: nil) }
+        echoWaiters = [:]
         peer.disconnect()
         clock.reset()
         pingTimer?.invalidate()
@@ -163,7 +198,7 @@ final class SessionCoordinator: ObservableObject {
         Task {
             await prepareLocally(newTrack, position: position)
             // Spotify needs a few seconds to load + seek + pause on every phone.
-            let wait: UInt64 = { if case .spotify = newTrack { return 3_000_000_000 } else { return 700_000_000 } }()
+            let wait: UInt64 = newTrack.isRemote ? 3_000_000_000 : 700_000_000
             try? await Task.sleep(nanoseconds: wait)
             let start = HostClock.nowNanos() + 1_500_000_000
             peer.send(.startAt(leaderTime: start, position: position))
@@ -218,6 +253,24 @@ final class SessionCoordinator: ObservableObject {
         case let .calibrationResult(corrections):
             applyCalibration(corrections)
 
+        case let .resumeProbePlan(slots):
+            runResumeProbe(slots: slots)
+
+        case let .echoMeasure(id, candidates):
+            Task {
+                let reading = await measureEcho(candidatesMillis: candidates)
+                peer.send(.echoResult(id: id, reading: reading), to: [from])
+            }
+
+        case let .echoResult(id, reading):
+            finishEchoRequest(id, reading)
+
+        case let .shift(aheadBy):
+            shiftTimeline(aheadByMillis: aheadBy)
+
+        case let .mute(muted):
+            activePlayer?.setMuted(muted)
+
         case let .status(status):
             peerStatuses[from.displayName] = status
         }
@@ -248,15 +301,29 @@ final class SessionCoordinator: ObservableObject {
         switch track {
         case .local: return localPlayer
         case .spotify: return spotifyPlayer
+        case .simulatedSpotify: return simulatedPlayer
+        }
+    }
+
+    /// Maps a local time (when sound leaves this speaker) to the track position
+    /// that should be heard then, including this speaker's echo-monitor trim.
+    private func expectation(_ timeline: Timeline) -> (Int64) -> Double {
+        let trim = trimMillis / 1000
+        return { [unowned self] local in
+            timeline.expectedPosition(atLeader: self.leaderTime(fromLocal: local)) + trim
         }
     }
 
     private func prepareLocally(_ track: TrackSource, position: Double) async {
+        activePlayer?.setMuted(false)
         activePlayer?.pause()
         let p = player(for: track)
         activePlayer = p
+        refreshResumeReadout()
         do {
-            try await p.prepare(track, position: position)
+            // Include the trim here so Spotify-style players are already at the
+            // right spot and `start` is a pure resume, with no seek.
+            try await p.prepare(track, position: position + trimMillis / 1000)
             lastError = nil
         } catch {
             lastError = error.localizedDescription
@@ -273,25 +340,32 @@ final class SessionCoordinator: ObservableObject {
             lastError = "Clock not synced yet; start may be off."
         }
         p.start(outputAtLocalNanos: localTime(fromLeader: newTimeline.leaderStart),
-                position: newTimeline.position)
+                position: newTimeline.position + trimMillis / 1000)
     }
 
     private func stopLocally() {
+        activePlayer?.setMuted(false)
         activePlayer?.pause()
         timeline = nil
     }
 
     private func resyncAfterInterruption() {
         guard let timeline, let p = activePlayer else { return }
+        let expected = expectation(timeline)
         let at = HostClock.nowNanos() + 400_000_000
-        p.start(outputAtLocalNanos: at, position: timeline.expectedPosition(atLeader: leaderTime(fromLocal: at)))
+        p.start(outputAtLocalNanos: at, position: expected(at))
+    }
+
+    /// Echo monitor asked this speaker to move. Positive = play ahead (earlier).
+    private func shiftTimeline(aheadByMillis ms: Double) {
+        trimMillis += ms
+        guard let timeline, let p = activePlayer, p.isPlaying else { return }
+        p.realign(expected: expectation(timeline))
     }
 
     private func tick() {
         if let timeline, let p = activePlayer, p.isPlaying {
-            p.tick { [unowned self] local in
-                timeline.expectedPosition(atLeader: self.leaderTime(fromLocal: local))
-            }
+            p.tick(expected: expectation(timeline))
         }
         clockRMSMillis = clock.isSynced ? clock.residualRMS / 1_000_000 : nil
         clockMinRTTMillis = clock.minRTTNanos?.nanosToMillis
@@ -308,7 +382,10 @@ final class SessionCoordinator: ObservableObject {
                                     errorMillis: playerErrorMillis,
                                     rate: playerRate,
                                     clockRMSMillis: clockRMSMillis,
-                                    routeName: routeName)
+                                    routeName: routeName,
+                                    resumeLatencyMillis: resumeLatencyMillis,
+                                    resumeJitterMillis: resumeJitterMillis,
+                                    trimMillis: trimMillis)
             peer.send(.status(status))
         }
     }
@@ -385,15 +462,198 @@ final class SessionCoordinator: ObservableObject {
         }
     }
 
+    // MARK: Resume-delay probe (Spotify-style engines)
+
+    var canMeasureResumeDelay: Bool {
+        isLeader && (track?.isRemote ?? false) && timeline == nil && (activePlayer?.isReady ?? false)
+    }
+
+    /// Leader: each phone, one at a time, plays about a second from the loaded
+    /// position and times its own `resume()` with its own mic. Three rounds,
+    /// averaged per phone.
+    func measureResumeDelays() {
+        guard canMeasureResumeDelay else { return }
+        let devices = [myID] + connectedPeers
+        var slots: [CalibrationSlot] = []
+        var t = HostClock.nowNanos() + 1_500_000_000
+        for _ in 0..<3 {
+            for id in devices {
+                slots.append(CalibrationSlot(peerID: id, leaderTime: t))
+                t += 2_500_000_000          // probe takes ~1.7 s, then the next phone
+            }
+        }
+        peer.send(.resumeProbePlan(slots: slots))
+        runResumeProbe(slots: slots)
+    }
+
+    private func runResumeProbe(slots: [CalibrationSlot]) {
+        guard let remote = activePlayer as? RemoteSyncPlayer, remote.isReady, !remote.isPlaying else {
+            resumeProbe = .failed("Load a Spotify or simulated-Spotify track first (and don't press play).")
+            return
+        }
+        let mySlots = slots.filter { $0.peerID == myID }.map { localTime(fromLeader: $0.leaderTime) }
+        resumeProbe = .running("Measuring resume delay… keep it quiet")
+        Task {
+            var values: [Double] = []
+            for slotTime in mySlots {
+                let wait = slotTime - HostClock.nowNanos()
+                if wait > 0 { try? await Task.sleep(nanoseconds: UInt64(wait)) }
+                if let v = await remote.measureResumeLatencyOnce(engine: localPlayer.engine) {
+                    values.append(v)
+                }
+            }
+            if let s = remote.applyResumeMeasurements(values) {
+                resumeProbe = .done(String(format: "Resume delay %.0f ms ± %.0f ms (%d of %d heard)",
+                                           s.mean, s.sd, values.count, mySlots.count))
+            } else {
+                resumeProbe = .failed("Couldn't hear this speaker start. Turn it up, or pick a part of the song that isn't silent.")
+            }
+            refreshResumeReadout()
+        }
+    }
+
+    private func refreshResumeReadout() {
+        if let remote = activePlayer as? RemoteSyncPlayer {
+            resumeLatencyMillis = remote.resumeLatencyMillis
+            resumeJitterMillis = remote.resumeJitterMillis
+        } else {
+            resumeLatencyMillis = nil
+            resumeJitterMillis = nil
+        }
+    }
+
+    // MARK: Echo monitor (leader)
+
+    private func echoMonitorChanged() {
+        monitorTask?.cancel()
+        monitorTask = nil
+        guard echoMonitorEnabled, isLeader else { return }
+        logEcho("Echo monitor on: checking every \(echoInterval) s while music plays")
+        monitorTask = Task { [weak self] in
+            var turn = 0
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.echoCheck(turn: turn)
+                turn += 1
+                try? await Task.sleep(nanoseconds: self.echoInterval * 1_000_000_000)
+            }
+        }
+    }
+
+    /// One check of one follower against this (the leader's) speaker.
+    private func echoCheck(turn: Int) async {
+        guard isLeader, timeline != nil, let p = activePlayer, p.isPlaying else { return }
+        let followers = connectedPeers.filter { peerStatuses[$0]?.playing == true }
+        guard !followers.isEmpty else {
+            logEcho("Waiting for another speaker to play")
+            return
+        }
+        let target = followers[turn % followers.count]
+        let others = followers.filter { $0 != target }
+        if !others.isEmpty && !p.canMute {
+            logEcho("With Spotify the echo monitor needs exactly 2 phones (Spotify can't be muted)")
+            return
+        }
+        guard let targetPeer = peerID(named: target) else { return }
+        let listener = monitorListenerID.isEmpty ? myID : monitorListenerID
+
+        // With 3+ phones, silence the rest so the mic hears one pair.
+        let mutedPeers = others.compactMap { peerID(named: $0) }
+        if !mutedPeers.isEmpty {
+            peer.send(.mute(true), to: mutedPeers)
+            try? await Task.sleep(nanoseconds: 600_000_000)
+        }
+        defer { if !mutedPeers.isEmpty { peer.send(.mute(false), to: mutedPeers) } }
+
+        let first = await requestEcho(from: listener, candidatesMillis: [])
+        switch corrector.assess(first?.strongest) {
+        case .noSignal:
+            logEcho("\(target): no clear echo (within ~4 ms, or too quiet)")
+        case .inSync(let lag):
+            logEcho(String(format: "%@: %.0f ms apart, under %.0f ms, left alone", target, lag, corrector.thresholdMillis))
+        case .reflection(let lag):
+            logEcho(String(format: "%@: peak at %.0f ms is a room reflection, ignored", target, lag))
+        case let .needsDirection(lag, nudge):
+            // Which one is ahead? Nudge the follower ahead and see where the echo goes.
+            peer.send(.shift(aheadByMillis: nudge), to: [targetPeer])
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            let candidates = corrector.candidateLags(lagMillis: lag, nudgeMillis: nudge)
+            let second = await requestEcho(from: listener, candidatesMillis: candidates)
+            switch corrector.resolve(lagMillis: lag, nudgeMillis: nudge, peaks: second?.candidatePeaks ?? []) {
+            case let .error(now, before):
+                peer.send(.shift(aheadByMillis: -now), to: [targetPeer])
+                logEcho(String(format: "%@ was %.0f ms %@: corrected", target, abs(before), before > 0 ? "ahead" : "behind"))
+            case .inconclusive:
+                peer.send(.shift(aheadByMillis: -nudge), to: [targetPeer])
+                logEcho(String(format: "%@: %.0f ms echo didn't follow the nudge, undone", target, lag))
+            }
+        }
+    }
+
+    private func requestEcho(from listener: String, candidatesMillis: [Double]) async -> EchoReading? {
+        if listener == myID { return await measureEcho(candidatesMillis: candidatesMillis) }
+        guard let listenerPeer = peerID(named: listener) else { return nil }
+        echoRequestID &+= 1
+        let id = echoRequestID
+        return await withCheckedContinuation { (cont: CheckedContinuation<EchoReading?, Never>) in
+            echoWaiters[id] = cont
+            peer.send(.echoMeasure(id: id, candidatesMillis: candidatesMillis), to: [listenerPeer])
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                self?.finishEchoRequest(id, nil)
+            }
+        }
+    }
+
+    private func finishEchoRequest(_ id: UInt32, _ reading: EchoReading?) {
+        echoWaiters.removeValue(forKey: id)?.resume(returning: reading)
+    }
+
+    /// Listener: record 4 s of whatever the speakers are playing and find the echo.
+    private func measureEcho(candidatesMillis: [Double]) async -> EchoReading? {
+        do { try localPlayer.ensureRunning() } catch { return nil }
+        let recorder = MicRecorder(engine: localPlayer.engine)
+        do { try recorder.start() } catch { return nil }
+        try? await Task.sleep(nanoseconds: 4_000_000_000)
+        guard let recording = recorder.stop() else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            SessionCoordinator.analyzeEcho(recording, candidatesMillis: candidatesMillis)
+        }.value
+    }
+
+    nonisolated static func analyzeEcho(_ recording: MicRecorder.Recording, candidatesMillis: [Double]) -> EchoReading? {
+        let sr = recording.sampleRate
+        guard let cepstrum = DSP.averagedCepstrum(of: recording.samples, sampleRate: sr) else { return nil }
+        func peak(_ e: DSP.EchoEstimate?) -> EchoPeak? {
+            e.map { EchoPeak(lagMillis: $0.lagSeconds * 1000, strength: $0.strength) }
+        }
+        let tolerance = EchoCorrector().candidateToleranceMillis / 1000
+        return EchoReading(
+            strongest: peak(DSP.strongestEcho(in: cepstrum, sampleRate: sr)),
+            candidatePeaks: candidatesMillis.map {
+                peak(DSP.echoPeak(in: cepstrum, sampleRate: sr, near: $0 / 1000, tolerance: tolerance))
+            })
+    }
+
+    private func logEcho(_ line: String) {
+        let time = Date().formatted(date: .omitted, time: .standard)
+        echoLog.insert("\(time)  \(line)", at: 0)
+        if echoLog.count > 8 { echoLog.removeLast() }
+    }
+
+    private func peerID(named name: String) -> MCPeerID? {
+        peer.connectedPeers.first { $0.displayName == name }
+    }
+
     // MARK: Spotify
 
-    func connectSpotify() { spotifyPlayer.authorize() }
+    func connectSpotify() { spotifyBackend.authorize() }
 
     func handleOpenURL(_ url: URL) {
-        _ = spotifyPlayer.handle(url: url)
+        _ = spotifyBackend.handle(url: url)
     }
 
     func appBecameActive() {
-        spotifyPlayer.reconnectIfNeeded()
+        spotifyBackend.reconnectIfNeeded()
     }
 }

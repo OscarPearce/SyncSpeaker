@@ -2,19 +2,16 @@ import Foundation
 
 /// Controls this phone's Spotify app through the Spotify iOS SDK (App Remote).
 ///
-/// We can't touch Spotify's audio, only send commands, so sync comes from
-/// *when* commands are sent:
-/// 1. prepare: play the URI, seek to the start position, pause. Audio is now buffered.
-/// 2. start: call `resume()` early by (route delay + learned resume latency).
-/// 3. tick: compare Spotify's reported position with the timeline and seek if
-///    it's clearly off. Fine correction comes from the echo check (M4/M5).
+/// We can't touch Spotify's audio, only send commands, so all the sync logic
+/// lives in `RemoteSyncPlayer`; this just carries the commands. The same logic
+/// is testable without Spotify through `SimulatedSpotifyBackend`.
 ///
 /// Builds without the SDK: add the `SpotifyiOS` package (see README) to enable it.
 #if canImport(SpotifyiOS)
 import SpotifyiOS
 
 @MainActor
-final class SpotifyPlayer: NSObject, SyncPlayer {
+final class SpotifyBackend: NSObject, RemoteBackend {
     // Fill these in from https://developer.spotify.com/dashboard
     // The redirect URI must also be registered in the dashboard.
     static let clientID = "YOUR_SPOTIFY_CLIENT_ID"
@@ -27,23 +24,14 @@ final class SpotifyPlayer: NSObject, SyncPlayer {
         return remote
     }()
 
+    let storageKey = "spotify"
+    /// App Remote has no volume control, so the echo monitor can't mute other
+    /// Spotify phones; with Spotify it needs exactly two speakers.
+    let canMute = false
     private(set) var isConnected = false
-    private(set) var isReady = false
-    private(set) var isPlaying = false
-    private(set) var lastErrorMillis: Double?
-    var currentRate: Double? { nil }   // Spotify has no rate control
+    private(set) var lastReport: RemotePositionReport?
 
     var onConnectionChange: ((Bool, String?) -> Void)?
-
-    /// Time from calling resume() until sound leaves the phone, learned over time.
-    /// Starts at a guess; the echo check refines it (DESIGN.md, Spotify extra step).
-    var resumeLatencyMillis: Double {
-        get { UserDefaults.standard.object(forKey: "spotifyResumeLatencyMillis") as? Double ?? 60 }
-        set { UserDefaults.standard.set(newValue, forKey: "spotifyResumeLatencyMillis") }
-    }
-
-    private var lastState: (positionMs: Int, receivedAt: Int64, paused: Bool)?
-    private var lastSeekNanos: Int64 = 0
 
     // MARK: Connection
 
@@ -76,62 +64,22 @@ final class SpotifyPlayer: NSObject, SyncPlayer {
         }
     }
 
-    // MARK: SyncPlayer
+    // MARK: RemoteBackend
 
-    func prepare(_ track: TrackSource, position: Double) async throws {
+    func load(_ track: TrackSource, position: Double) async throws {
         guard case let .spotify(uri, _) = track else { throw PlayerError.wrongSource }
         guard isConnected, let api = appRemote.playerAPI else { throw PlayerError.spotifyNotConnected }
-        isReady = false
         try await call { api.play(uri, callback: $0) }
         try await Task.sleep(nanoseconds: 700_000_000)        // let Spotify load the track
         try await call { api.seek(toPosition: Int(position * 1000), callback: $0) }
         try await call { api.pause($0) }
         try await Task.sleep(nanoseconds: 500_000_000)        // let it settle and buffer
-        isReady = true
     }
 
-    func start(outputAtLocalNanos t: Int64, position: Double) {
-        guard let api = appRemote.playerAPI else { return }
-        let fireAt = t - AudioRoute.totalOutputDelayNanos - resumeLatencyMillis.millisToNanos
-        // Wake up ~3 ms early on the main queue, then spin for the last bit:
-        // asyncAfter alone can be a few ms late.
-        let wake = max(fireAt - 3_000_000, HostClock.nowNanos())
-        DispatchQueue.main.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: UInt64(wake))) {
-            while HostClock.nowNanos() < fireAt {}
-            api.resume(nil)
-        }
-        isPlaying = true
-    }
-
-    func pause() {
-        appRemote.playerAPI?.pause(nil)
-        isPlaying = false
-        lastErrorMillis = nil
-    }
-
-    func tick(expected: (Int64) -> Double) {
-        guard isPlaying, let s = lastState, !s.paused else { return }
-        // Position reports arrive only on state changes and are coarse, so
-        // extrapolate from the last one and act only on big errors.
-        let now = HostClock.nowNanos()
-        let reported = Double(s.positionMs) / 1000 + (now - s.receivedAt).nanosToSeconds
-        let error = reported - expected(now + AudioRoute.totalOutputDelayNanos)
-        lastErrorMillis = error * 1000
-
-        guard abs(error) > 0.150, now - lastSeekNanos > 20_000_000_000 else { return }
-        lastSeekNanos = now
-        let seekLead: Int64 = 150_000_000               // rough seek latency
-        let target = expected(now + seekLead + AudioRoute.totalOutputDelayNanos)
-        appRemote.playerAPI?.seek(toPosition: Int(target * 1000), callback: nil)
-    }
-
-    /// Fine correction from an external measurement such as the echo check.
-    /// Positive = this speaker is ahead.
-    func applyMeasuredOffset(millis: Double) {
-        resumeLatencyMillis = max(0, resumeLatencyMillis - millis)
-    }
-
-    // MARK: Helpers
+    func resume() { appRemote.playerAPI?.resume(nil) }
+    func pause() { appRemote.playerAPI?.pause(nil) }
+    func seek(to position: Double) { appRemote.playerAPI?.seek(toPosition: Int(position * 1000), callback: nil) }
+    func setMuted(_ muted: Bool) {}
 
     private func call(_ body: (@escaping SPTAppRemoteCallback) -> Void) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -143,7 +91,7 @@ final class SpotifyPlayer: NSObject, SyncPlayer {
 }
 
 // The SDK calls these on its own schedule; hop to the main actor explicitly.
-extension SpotifyPlayer: SPTAppRemoteDelegate {
+extension SpotifyBackend: SPTAppRemoteDelegate {
     nonisolated func appRemoteDidEstablishConnection(_ appRemote: SPTAppRemote) {
         Task { @MainActor in
             self.isConnected = true
@@ -165,19 +113,18 @@ extension SpotifyPlayer: SPTAppRemoteDelegate {
         let message = error?.localizedDescription
         Task { @MainActor in
             self.isConnected = false
-            self.isReady = false
             self.onConnectionChange?(false, message)
         }
     }
 }
 
-extension SpotifyPlayer: SPTAppRemotePlayerStateDelegate {
+extension SpotifyBackend: SPTAppRemotePlayerStateDelegate {
     nonisolated func playerStateDidChange(_ playerState: SPTAppRemotePlayerState) {
         let receivedAt = HostClock.nowNanos()          // stamp before any hop
-        let position = playerState.playbackPosition
+        let position = Double(playerState.playbackPosition) / 1000
         let paused = playerState.isPaused
         Task { @MainActor in
-            self.lastState = (position, receivedAt, paused)
+            self.lastReport = RemotePositionReport(position: position, atLocalNanos: receivedAt, paused: paused)
         }
     }
 }
@@ -186,22 +133,21 @@ extension SpotifyPlayer: SPTAppRemotePlayerStateDelegate {
 
 /// Stand-in used when the Spotify SDK isn't linked, so the rest of the app builds.
 @MainActor
-final class SpotifyPlayer: SyncPlayer {
+final class SpotifyBackend: RemoteBackend {
+    let storageKey = "spotify"
     let isConnected = false
-    let isReady = false
-    let isPlaying = false
-    let lastErrorMillis: Double? = nil
-    var currentRate: Double? { nil }
+    let canMute = false
+    let lastReport: RemotePositionReport? = nil
     var onConnectionChange: ((Bool, String?) -> Void)?
 
     func authorize() { onConnectionChange?(false, PlayerError.spotifyUnavailable.errorDescription) }
     func handle(url: URL) -> Bool { false }
     func reconnectIfNeeded() {}
-    func prepare(_ track: TrackSource, position: Double) async throws { throw PlayerError.spotifyUnavailable }
-    func start(outputAtLocalNanos: Int64, position: Double) {}
+    func load(_ track: TrackSource, position: Double) async throws { throw PlayerError.spotifyUnavailable }
+    func resume() {}
     func pause() {}
-    func tick(expected: (Int64) -> Double) {}
-    func applyMeasuredOffset(millis: Double) {}
+    func seek(to position: Double) {}
+    func setMuted(_ muted: Bool) {}
 }
 
 #endif

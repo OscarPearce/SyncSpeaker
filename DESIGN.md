@@ -51,7 +51,9 @@ speaker, and keep the speakers in sync to within ~30 ms at the listener's positi
 │                       ▼                       ▼              │
 │                 SyncPlayer protocol ◄── DriftController      │
 │                 ├─ LocalEnginePlayer (AVAudioEngine)         │
-│                 └─ SpotifyPlayer (SPTAppRemote)              │
+│                 └─ RemoteSyncPlayer ◄── EchoCorrector        │
+│                     ├─ SpotifyBackend (SPTAppRemote)         │
+│                     └─ SimulatedSpotifyBackend (testing)     │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
           ▲  peer-to-peer messages (Wi-Fi / Bluetooth LE)  ▲
@@ -136,15 +138,48 @@ protocol SyncPlayer {
 - Drift correction: a PI controller nudges varispeed `rate` within ±0.2%
   (≈3.5 cents of pitch, inaudible). Errors above 80 ms trigger a hard re-seek.
 
-**SpotifyPlayer** (`SPTAppRemote`):
+**RemoteSyncPlayer** (command-only players) wraps a `RemoteBackend`: either
+`SpotifyBackend` (`SPTAppRemote`) or `SimulatedSpotifyBackend`, which plays a
+local file but only takes resume/pause/seek, with Spotify-like random delays,
+seek landing error and coarse position reports. The simulated one lets the
+whole Spotify path be tested on phones before Spotify is set up.
 - Prepare: `play(uri)`, then `seek(position)`, then `pause()` a few seconds
   before the start time, so the audio is already buffered.
-- Start: call `resume()` at `T0 − measuredResumeLatency − routeDelay`.
-  `measuredResumeLatency` is a running average of how long Spotify takes to make
-  sound after `resume`. It's learned during calibration and refined over time.
+- Start: call `resume()` at `T0 − resumeLatency − routeDelay`. Resuming
+  buffered audio is far more consistent than a cold play or a seek.
+- Resume latency is **measured per phone**: with the track loaded and paused,
+  the leader schedules each phone in turn to resume for ~1.2 s while its own
+  mic records; an onset detector (`DSP.onsetIndex`) times the first sound.
+  Three rounds, outliers (> 50 ms from the median) dropped, mean stored.
 - Position: `playerState.playbackPosition` (integer ms, only reported on state
-  changes, so it's coarse). Drift is checked every ~10 s using the acoustic
-  echo check below. If the error exceeds 40 ms, the player seeks.
+  changes, so it's coarse). Used only as a safety net: seek if > 150 ms off,
+  at most once per 20 s. Fine sync comes from the echo monitor below.
+
+### Echo monitor (`EchoCorrector`)
+
+While music plays, two speakers playing the same song slightly apart sound
+like an echo to a microphone. Every 15 s the leader asks the listening phone
+to record 4 s; the averaged cepstrum peaks at the lag between the speakers.
+No test signals are needed, so it works on any song.
+
+- Under **20 ms**: leave it alone. Each correction is a seek with its own
+  random error, so chasing small offsets makes sync worse.
+- Over 20 ms: the lag doesn't say which speaker is ahead, so the follower is
+  nudged ahead by 25–60 ms and measured again. The echo moves to about
+  `L0 + nudge` (follower was ahead) or `|L0 − nudge|` (it was behind); the
+  listener reports the strongest peak within ±12 ms of each. The correction
+  uses that measured lag, so the nudge's own seek error is fixed too.
+- A peak that doesn't follow the nudge is a room reflection; its lag is
+  remembered and skipped.
+- With 3+ phones, the other followers are muted during a check so the mic
+  hears one pair. Spotify can't be muted through App Remote, so with Spotify
+  the monitor needs exactly two phones (the simulated engine can mute).
+- The leader is the reference; followers move by `shift` messages and keep a
+  running trim that's applied to every later start too.
+
+`sim/simulate.py` (`sim_echo_monitor`) runs 5-minute sessions with seek
+noise, drift and Bluetooth re-buffers, and compares the 20 ms threshold with
+correcting every offset.
 
 ### Calibration (`Calibrator`)
 
@@ -197,7 +232,13 @@ startAt(leaderTime, position)         ← the timeline
 pause(atLeaderTime)
 calibrationPlan(listener, slots)      ← leader → all
 calibrationResult(corrections)        ← listener → all
-status(position, error, rate, ready)  ← follower → leader, ~1 Hz
+resumeProbePlan(slots)                ← leader → all; each phone times its own resume
+echoMeasure(id, candidates)           ← leader → listener; record 4 s
+echoResult(id, reading)               ← listener → leader
+shift(aheadByMillis)                  ← leader → one follower (nudge / correction)
+mute(on)                              ← leader → other followers during a check
+status(position, error, rate, ready,
+       resumeLatency, trim)           ← follower → leader, ~1 Hz
 ```
 
 ## Expected accuracy budget
