@@ -1,0 +1,95 @@
+# Builds SyncSpeaker on a GitHub-hosted Mac, so no local Mac is needed.
+#
+# Produces an unsigned SyncSpeaker.ipa (under the run's "Artifacts").
+# Install it on an iPhone from Windows with Sideloadly, which signs it with
+# your free Apple ID. See README → "Building without a Mac".
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Algorithm simulations. Linux minutes are cheaper than macOS ones.
+  simulate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - run: python sim/simulate.py
+
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Unit tests (iOS Simulator)
+        run: |
+          # Pick whichever iPhone simulator this runner image has.
+          SIM_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devs = json.load(sys.stdin)["devices"]
+          ios = [d for rt, ds in devs.items() if "iOS" in rt for d in ds if d["name"].startswith("iPhone")]
+          print(ios[-1]["udid"])')
+          echo "Using simulator $SIM_ID"
+          xcodebuild test \
+            -project SyncSpeaker.xcodeproj \
+            -scheme SyncSpeaker \
+            -destination "id=$SIM_ID" \
+            CODE_SIGNING_ALLOWED=NO > test.log 2>&1 \
+            || { grep -E "error:|failed" test.log | sort -u | head -80; tail -30 test.log; exit 1; }
+          grep -E "Test Case .* (passed|failed)|\*\* TEST" test.log
+
+      - name: Build for iPhone (unsigned)
+        run: |
+          xcodebuild build \
+            -project SyncSpeaker.xcodeproj \
+            -scheme SyncSpeaker \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" > build.log 2>&1 \
+            || { grep -E "error:" build.log | sort -u | head -80; tail -30 build.log; exit 1; }
+          grep -E "warning: .*SyncSpeaker/|\*\* BUILD" build.log | sort -u | head -60
+
+      - name: Package .ipa
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/SyncSpeaker.app Payload/
+          zip -qr SyncSpeaker.ipa Payload
+          ls -lh SyncSpeaker.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SyncSpeaker-ipa
+          path: SyncSpeaker.ipa
+          retention-days: 30
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcode-logs
+          path: |
+            test.log
+            build.log
+          if-no-files-found: ignore

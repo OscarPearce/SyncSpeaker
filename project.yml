@@ -1,0 +1,71 @@
+# XcodeGen spec. Generate the Xcode project with:
+#   brew install xcodegen && xcodegen generate
+name: SyncSpeaker
+options:
+  bundleIdPrefix: com.example          # change to your own reverse-DNS prefix
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    DEVELOPMENT_TEAM: ""               # set your Apple team ID (or pick it in Xcode)
+    TARGETED_DEVICE_FAMILY: "1"        # iPhone
+
+targets:
+  SyncSpeaker:
+    type: application
+    platform: iOS
+    sources:
+      - path: SyncSpeaker
+    info:
+      path: SyncSpeaker/Info.plist
+      properties:
+        CFBundleDisplayName: SyncSpeaker
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIBackgroundModes: [audio]
+        NSMicrophoneUsageDescription: >-
+          SyncSpeaker listens to short test chirps from each speaker to measure
+          and correct their delay. Audio is analysed on this phone and never saved or sent.
+        NSLocalNetworkUsageDescription: >-
+          SyncSpeaker connects to nearby phones in your session to start music at the same time.
+        NSBonjourServices: [_syncspk._tcp, _syncspk._udp]
+        # Lets you add music files from the Files app / Finder.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        # Spotify App Remote: open the Spotify app, and receive the auth callback.
+        LSApplicationQueriesSchemes: [spotify]
+        CFBundleURLTypes:
+          - CFBundleURLName: spotify-callback
+            CFBundleURLSchemes: [syncspeaker]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.syncspeaker
+        GENERATE_INFOPLIST_FILE: NO
+    # To enable Spotify, uncomment after following README "Spotify setup":
+    # dependencies:
+    #   - package: SpotifyiOS
+    #     product: SpotifyiOS
+
+  SyncSpeakerTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: SyncSpeakerTests
+    dependencies:
+      - target: SyncSpeaker
+
+# packages:
+#   SpotifyiOS:
+#     url: https://github.com/spotify/ios-sdk
+#     from: 5.0.1
+
+schemes:
+  SyncSpeaker:
+    build:
+      targets:
+        SyncSpeaker: all
+        SyncSpeakerTests: [test]
+    test:
+      targets: [SyncSpeakerTests]

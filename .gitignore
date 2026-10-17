@@ -1,0 +1,8 @@
+SyncSpeaker.xcodeproj/
+build/
+Payload/
+*.ipa
+DerivedData/
+.DS_Store
+xcuserdata/
+__pycache__/
